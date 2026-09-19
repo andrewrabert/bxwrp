@@ -9,7 +9,8 @@ use rmcp::handler::server::common::schema_for_type;
 use rmcp::handler::server::router::tool::{ToolRoute, ToolRouter};
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::model::{
-    CallToolResult, ContentBlock, Implementation, JsonObject, ServerCapabilities, ServerInfo, Tool,
+    CallToolResult, ContentBlock, Implementation, JsonObject, ServerCapabilities, ServerConfig,
+    Tool,
 };
 use rmcp::transport::stdio;
 use rmcp::{ServerHandler, ServiceExt, tool_handler};
@@ -675,8 +676,8 @@ impl Server {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for Server {
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("bxwrp", env!("CARGO_PKG_VERSION")));
         if let Some(instructions) = self.settings.instructions() {
             info = info.with_instructions(instructions);
