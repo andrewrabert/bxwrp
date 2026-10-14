@@ -884,6 +884,7 @@ fn mount_layers(
 pub struct Settings {
     backend: crate::backend::Kind,
 
+    #[cfg(not(target_os = "android"))]
     http: Http,
 
     username: String,
@@ -943,6 +944,7 @@ impl Settings {
             None => Some(bashkit::NetworkAllowlist::new().block_private_ips(true)),
         };
 
+        #[cfg(not(target_os = "android"))]
         let http = match config.http {
             Some(HttpConfig { enabled: true }) => Http::Enabled,
             Some(HttpConfig { enabled: false }) | None => Http::Disabled,
@@ -950,6 +952,7 @@ impl Settings {
 
         Ok(Self {
             backend: config.backend.unwrap_or_default(),
+            #[cfg(not(target_os = "android"))]
             http,
             username: config.username.unwrap_or_else(|| SANDBOX_USERNAME.into()),
             hostname: config.hostname.unwrap_or_else(|| SANDBOX_HOSTNAME.into()),
@@ -973,6 +976,7 @@ impl Settings {
         self.backend
     }
 
+    #[cfg(not(target_os = "android"))]
     pub(crate) const fn http(&self) -> Http {
         self.http
     }
