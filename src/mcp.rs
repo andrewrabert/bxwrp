@@ -678,7 +678,7 @@ impl Server {
 impl ServerHandler for Server {
     fn get_info(&self) -> ServerConfig {
         let mut info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("bxwrp", env!("CARGO_PKG_VERSION")));
+            .with_server_info(Implementation::new(crate::APP_NAME, crate::APP_VERSION));
         if let Some(instructions) = self.settings.instructions() {
             info = info.with_instructions(instructions);
         }

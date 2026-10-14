@@ -1,7 +1,10 @@
 [package]
 name = "bxwrp"
-version = "0.1.0"
+version = "0.1.0-dev"
 edition = "2024"
+
+[build-dependencies]
+vergen-gix = { version = "10", features = ["emit_and_set"] }
 
 [lints.rust]
 warnings = "deny"

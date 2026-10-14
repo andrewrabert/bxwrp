@@ -10,7 +10,11 @@ use crate::config::{
 };
 
 #[derive(clap::Parser)]
-#[command(name = "bxwrp", arg_required_else_help = true)]
+#[command(
+    name = crate::APP_NAME,
+    version = crate::APP_VERSION,
+    arg_required_else_help = true
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub mode: Mode,
