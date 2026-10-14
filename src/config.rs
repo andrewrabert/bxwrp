@@ -907,7 +907,7 @@ impl Settings {
     }
 
     fn resolve(config: Config, host_cwd: &Path) -> anyhow::Result<Self> {
-        let config_value = minijinja::Value::from_serialize(&config);
+        let config_value = minijinja::Value::from(minijinja::value::Serde(&config));
         let command_not_found = crate::template::render_message(
             config
                 .command_not_found
