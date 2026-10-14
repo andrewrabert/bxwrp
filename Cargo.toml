@@ -2,6 +2,7 @@
 name = "bxwrp"
 version = "0.1.0-dev"
 edition = "2024"
+license = "MIT"
 
 [build-dependencies]
 vergen-gix = { version = "10", features = ["emit_and_set"] }
