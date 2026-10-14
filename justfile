@@ -8,3 +8,7 @@ fmt:
 
 clippy:
     cargo clippy --all-targets -- -D warnings
+
+# List outdated dependencies
+outdated:
+    cargo outdated --root-deps-only
