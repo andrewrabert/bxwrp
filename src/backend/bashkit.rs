@@ -34,6 +34,37 @@ fn view(path: &Path) -> impl Fn() -> String + use<> {
     move || format!("view of {}", path.display())
 }
 
+fn memory_targets(settings: &Settings) -> Vec<PathBuf> {
+    settings
+        .layers
+        .iter()
+        .filter(|layer| {
+            matches!(
+                layer.source,
+                Source::Memory {
+                    mode: MountMode::ReadWrite
+                }
+            )
+        })
+        .map(|layer| layer.target.clone())
+        .collect()
+}
+
+async fn mkdir_missing(
+    memory: &Arc<dyn bashkit::FileSystem>,
+    targets: &[PathBuf],
+) -> anyhow::Result<()> {
+    for target in targets {
+        if !memory.exists(target).await.with_context(view(target))? {
+            memory
+                .mkdir(target, true)
+                .await
+                .with_context(view(target))?;
+        }
+    }
+    Ok(())
+}
+
 async fn build_layers(
     settings: &Settings,
     memory: &Arc<dyn bashkit::FileSystem>,
@@ -49,20 +80,10 @@ async fn build_layers(
         };
         layers.push(match &layer.source {
             Source::Remove => Layer::removed(target),
-            Source::Memory { mode } => {
-                if matches!(mode, MountMode::ReadWrite)
-                    && !memory.exists(target).await.with_context(view(target))?
-                {
-                    memory
-                        .mkdir(target, true)
-                        .await
-                        .with_context(view(target))?;
-                }
-                match mode {
-                    MountMode::ReadOnly => Layer::shared(target, Arc::clone(&readonly)),
-                    MountMode::ReadWrite => Layer::shared(target, Arc::clone(memory)),
-                }
-            }
+            Source::Memory { mode } => match mode {
+                MountMode::ReadOnly => Layer::shared(target, Arc::clone(&readonly)),
+                MountMode::ReadWrite => Layer::shared(target, Arc::clone(memory)),
+            },
             Source::HostDir { host, mode } => {
                 let real = real_fs(host, *mode)
                     .await
@@ -128,13 +149,92 @@ fn not_found_suffix(settings: &Settings) -> String {
     }
 }
 
+const BUILD_ONLY_ENV: [&str; 1] = ["BASHKIT_ALLOW_INPROCESS_SQLITE"];
+
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+fn session_parent(path: &Path) -> anyhow::Result<&Path> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("session {}", path.display()))?;
+    anyhow::ensure!(
+        parent.is_dir(),
+        "session {}: parent directory does not exist",
+        path.display()
+    );
+    Ok(parent)
+}
+
+fn lock_session(path: &Path) -> anyhow::Result<std::fs::File> {
+    let context = || format!("session {}", path.display());
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(with_suffix(path, ".lock"))
+        .with_context(context)?;
+    lock.lock().with_context(context)?;
+    session_parent(path)?;
+    Ok(lock)
+}
+
+fn read_session(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            anyhow::ensure!(
+                !meta.file_type().is_symlink(),
+                "session {}: is a symlink",
+                path.display()
+            );
+            Ok(Some(
+                std::fs::read(path).with_context(|| format!("session {}", path.display()))?,
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("session {}", path.display())),
+    }
+}
+
+fn write_session(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let context = || format!("session {}", path.display());
+    let parent = session_parent(path)?;
+    let tmp = with_suffix(path, ".tmp");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)
+        .with_context(context)?;
+    file.write_all(bytes).with_context(context)?;
+    file.sync_all().with_context(context)?;
+    drop(file);
+    std::fs::rename(&tmp, path).with_context(context)?;
+    std::fs::File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .with_context(context)?;
+    Ok(())
+}
+
 pub(super) struct Bashkit {
     bash: Mutex<bashkit::Bash>,
     fs: Arc<dyn bashkit::FileSystem>,
+    memory: Arc<dyn bashkit::FileSystem>,
+    memory_targets: Vec<PathBuf>,
+    env: Vec<(String, String)>,
+    session: Option<PathBuf>,
+    session_guard: Mutex<()>,
 }
 
 impl Bashkit {
-    pub(super) async fn new(settings: &Settings) -> anyhow::Result<Self> {
+    pub(super) async fn new(settings: &Settings, session: Option<PathBuf>) -> anyhow::Result<Self> {
         let memory: Arc<dyn bashkit::FileSystem> = Arc::new(bashkit::InMemoryFs::new());
         if !memory
             .exists(&settings.cwd)
@@ -146,6 +246,8 @@ impl Bashkit {
                 .await
                 .with_context(view(&settings.cwd))?;
         }
+        let memory_targets = memory_targets(settings);
+        mkdir_missing(&memory, &memory_targets).await?;
 
         let layers = build_layers(settings, &memory).await?;
         let table: Arc<dyn bashkit::FileSystem> =
@@ -179,10 +281,8 @@ impl Bashkit {
         builder = builder.command_resolver(Arc::new(NotFoundResolver {
             suffix: not_found_suffix(settings).into(),
         }));
-        let mut build_only_env = Vec::new();
         builder = builder.cpython();
         builder = builder.sqlite().env("BASHKIT_ALLOW_INPROCESS_SQLITE", "1");
-        build_only_env.push("BASHKIT_ALLOW_INPROCESS_SQLITE");
         builder = builder.typescript();
         let mut bash = builder.build();
 
@@ -191,7 +291,7 @@ impl Bashkit {
         for (key, value) in settings.env() {
             state.env.insert(key.to_string(), value.to_string());
         }
-        for key in build_only_env {
+        for key in BUILD_ONLY_ENV {
             state.variables.remove(key);
         }
         bash.restore_shell_state(&state);
@@ -200,7 +300,55 @@ impl Bashkit {
         Ok(Self {
             bash: Mutex::new(bash),
             fs,
+            memory,
+            memory_targets,
+            env: settings
+                .env()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            session,
+            session_guard: Mutex::new(()),
         })
+    }
+
+    /// Normal setup on top of a restored snapshot, keeping its env and cwd.
+    async fn resume(&self, bash: &mut bashkit::Bash, snapshot: &[u8]) -> anyhow::Result<()> {
+        bash.restore_snapshot(snapshot)?;
+        mkdir_missing(&self.memory, &self.memory_targets).await?;
+        for (key, value) in &self.env {
+            bash.set_env(key, value);
+        }
+        let mut state = bash.shell_state();
+        for key in BUILD_ONLY_ENV {
+            state.variables.remove(key);
+        }
+        bash.restore_shell_state(&state);
+        Ok(())
+    }
+
+    /// Runs `op` against the session file: restore before, save after success.
+    async fn session<T>(&self, op: impl AsyncFnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+        let Some(path) = &self.session else {
+            return op().await;
+        };
+        let _guard = self.session_guard.lock().await;
+        let lock = {
+            let path = path.clone();
+            tokio::task::spawn_blocking(move || lock_session(&path)).await??
+        };
+        let snapshot = {
+            let path = path.clone();
+            tokio::task::spawn_blocking(move || read_session(&path)).await??
+        };
+        if let Some(snapshot) = snapshot {
+            self.resume(&mut *self.bash.lock().await, &snapshot).await?;
+        }
+        let result = op().await?;
+        let bytes = self.bash.lock().await.snapshot()?;
+        let path = path.clone();
+        tokio::task::spawn_blocking(move || write_session(&path, &bytes)).await??;
+        drop(lock);
+        Ok(result)
     }
 
     pub async fn exec_script(
@@ -246,7 +394,9 @@ impl Backend for Bashkit {
             ScriptInput::Closed => None,
             ScriptInput::Bytes(bytes) => Some(bytes),
         };
-        let result = Self::exec_script(self, script, arg0, args, stdin).await?;
+        let result = self
+            .session(async || Ok(Self::exec_script(self, script, arg0, args, stdin).await?))
+            .await?;
         let exit_code = match result.control_flow {
             bashkit::ControlFlow::Exit(code) => code,
             _ => result.exit_code,
@@ -259,19 +409,23 @@ impl Backend for Bashkit {
     }
 
     async fn read_text(&self, path: &Path) -> anyhow::Result<String> {
-        vfs(self, path).read_text().await
+        let path = vfs(self, path);
+        self.session(async || path.read_text().await).await
     }
 
     async fn write_text(&self, path: &Path, content: &str) -> anyhow::Result<Written> {
         let path = vfs(self, path);
-        let existed = path.exists().await?;
-        path.parent().mkdir_parents().await?;
-        path.write_text(content).await?;
-        Ok(if existed {
-            Written::Updated
-        } else {
-            Written::Created
+        self.session(async || {
+            let existed = path.exists().await?;
+            path.parent().mkdir_parents().await?;
+            path.write_text(content).await?;
+            Ok(if existed {
+                Written::Updated
+            } else {
+                Written::Created
+            })
         })
+        .await
     }
 }
 

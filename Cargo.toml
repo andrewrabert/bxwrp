@@ -30,7 +30,7 @@ bashkit = { version = "0.19", features = [
     "logging",
     "bot-auth",
 ] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 etcetera = "0.11"
 ignore = "0.4"
 indexmap = { version = "2", features = ["serde"] }

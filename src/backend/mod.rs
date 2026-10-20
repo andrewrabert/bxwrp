@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
@@ -52,9 +52,16 @@ pub trait Backend: Send + Sync {
     async fn write_text(&self, path: &Path, content: &str) -> anyhow::Result<Written>;
 }
 
-pub async fn new(settings: &Settings) -> anyhow::Result<Box<dyn Backend>> {
+pub async fn new(
+    settings: &Settings,
+    session: Option<PathBuf>,
+) -> anyhow::Result<Box<dyn Backend>> {
+    anyhow::ensure!(
+        session.is_none() || settings.backend() == Kind::Bashkit,
+        "--session is only supported by the bashkit backend"
+    );
     match settings.backend() {
-        Kind::Bashkit => Ok(Box::new(Bashkit::new(settings).await?)),
+        Kind::Bashkit => Ok(Box::new(Bashkit::new(settings, session).await?)),
         #[cfg(target_os = "linux")]
         Kind::Bwrap => Ok(Box::new(bwrap::Bwrap::new(settings).await?)),
         #[cfg(target_os = "macos")]

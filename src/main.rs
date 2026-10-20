@@ -1,4 +1,5 @@
 use std::io::{IsTerminal, Read, Write};
+use std::path::PathBuf;
 
 use bxwrp::bridge::{BRIDGE_ENV, shim};
 use bxwrp::cli::{Cli, ConfigAction, Mode, Options};
@@ -97,6 +98,7 @@ fn sh_alias_main(raw: Vec<String>) -> anyhow::Result<()> {
     let host = Host::load(&[])?;
     install_log_subscriber();
     let settings = host.resolve(Config::default())?;
+    let session = session_path(std::env::var_os("BXWRP_SESSION").map(PathBuf::from))?;
     let target = if raw.is_empty() {
         stdin_script_target()?
     } else {
@@ -105,12 +107,13 @@ fn sh_alias_main(raw: Vec<String>) -> anyhow::Result<()> {
             args: raw,
         }
     };
-    run(target, settings)
+    run(target, settings, session)
 }
 
-fn shell_main(exec: Option<Vec<String>>, options: Options) -> anyhow::Result<()> {
+fn shell_main(exec: Option<Vec<String>>, mut options: Options) -> anyhow::Result<()> {
     let host = Host::load(&options.config)?;
     install_log_subscriber();
+    let session = session_path(options.session.take())?;
     let overlay = options.into_config()?;
     let settings = host.resolve(overlay)?;
     let target = match exec {
@@ -124,7 +127,11 @@ fn shell_main(exec: Option<Vec<String>>, options: Options) -> anyhow::Result<()>
             }
         }
     };
-    run(target, settings)
+    run(target, settings, session)
+}
+
+fn session_path(path: Option<PathBuf>) -> anyhow::Result<Option<PathBuf>> {
+    Ok(path.map(std::path::absolute).transpose()?)
 }
 
 fn stdin_script_target() -> anyhow::Result<Target> {
@@ -135,7 +142,11 @@ fn stdin_script_target() -> anyhow::Result<Target> {
     Ok(Target::StdinScript)
 }
 
-fn run(target: Target, settings: bxwrp::config::Settings) -> anyhow::Result<()> {
+fn run(
+    target: Target,
+    settings: bxwrp::config::Settings,
+    session: Option<PathBuf>,
+) -> anyhow::Result<()> {
     let stdin_is_pipe = !std::io::stdin().is_terminal();
     let invocation = match target {
         Target::Mcp => None,
@@ -161,7 +172,7 @@ fn run(target: Target, settings: bxwrp::config::Settings) -> anyhow::Result<()> 
         Some(bytes) => ScriptInput::Bytes(bytes),
     };
     let result = tokio::runtime::Runtime::new()?.block_on(async {
-        let sandbox = bxwrp::backend::new(&settings).await?;
+        let sandbox = bxwrp::backend::new(&settings, session).await?;
         if let Some((script, arg0, args, _)) = invocation {
             Ok::<_, anyhow::Error>(Some(
                 sandbox.exec_script(&script, &arg0, args, stdin).await?,

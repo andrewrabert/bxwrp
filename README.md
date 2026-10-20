@@ -17,6 +17,7 @@ Commands:
 
 Options:
       --config <PATH>
+      --session <PATH>                             [env: BXWRP_SESSION=]
       --backend <BACKEND>                          [possible values: bashkit, bwrap, seatbelt]
       --exclude <PATTERN>
       --include <PATTERN>

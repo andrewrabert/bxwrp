@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bashkit::{
-    DirEntry, FileSystem, FileSystemExt, FsLimits, FsUsage, Metadata, async_trait, normalize_path,
+    DirEntry, FileSystem, FileSystemExt, FsLimits, FsUsage, Metadata, VfsSnapshot, async_trait,
+    normalize_path,
 };
 
 const ENOENT: i32 = 2;
@@ -132,6 +133,14 @@ impl FileSystemExt for MountTable {
 
     fn backend_kind(&self) -> &'static str {
         self.root.backend_kind()
+    }
+
+    fn vfs_snapshot(&self) -> Option<VfsSnapshot> {
+        self.root.vfs_snapshot()
+    }
+
+    fn vfs_restore(&self, snapshot: &VfsSnapshot) -> bashkit::Result<()> {
+        self.root.vfs_restore(snapshot)
     }
 }
 
@@ -376,6 +385,14 @@ impl FileSystemExt for FilterFs {
 
     fn backend_kind(&self) -> &'static str {
         self.inner.backend_kind()
+    }
+
+    fn vfs_snapshot(&self) -> Option<VfsSnapshot> {
+        self.inner.vfs_snapshot()
+    }
+
+    fn vfs_restore(&self, snapshot: &VfsSnapshot) -> bashkit::Result<()> {
+        self.inner.vfs_restore(snapshot)
     }
 }
 

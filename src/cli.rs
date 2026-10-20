@@ -57,6 +57,15 @@ pub struct Options {
     )]
     pub config: Vec<PathBuf>,
 
+    #[arg(
+        long,
+        global = true,
+        env = "BXWRP_SESSION",
+        value_parser = OsStringValueParser::new().map(PathBuf::from),
+        value_name = "PATH"
+    )]
+    pub session: Option<PathBuf>,
+
     #[arg(long, global = true, value_enum, value_name = "BACKEND")]
     pub backend: Option<crate::backend::Kind>,
 
