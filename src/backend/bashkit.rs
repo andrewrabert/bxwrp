@@ -164,7 +164,8 @@ impl Bashkit {
             .hostname(settings.hostname())
             .username(settings.username())
             .cwd(settings.cwd.clone())
-            .fs(table);
+            .fs(table)
+            .rootfs(false);
         for (key, value) in settings.env() {
             builder = builder.env(key, value);
         }

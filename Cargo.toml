@@ -20,7 +20,7 @@ use_self = "warn"
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
-bashkit = { version = "0.18", features = [
+bashkit = { version = "0.19", features = [
     "realfs",
     "http_client",
     "python",
