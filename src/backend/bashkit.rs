@@ -180,8 +180,7 @@ impl Bashkit {
             suffix: not_found_suffix(settings).into(),
         }));
         let mut build_only_env = Vec::new();
-        builder = builder.python().env("BASHKIT_ALLOW_INPROCESS_PYTHON", "1");
-        build_only_env.push("BASHKIT_ALLOW_INPROCESS_PYTHON");
+        builder = builder.cpython();
         builder = builder.sqlite().env("BASHKIT_ALLOW_INPROCESS_SQLITE", "1");
         build_only_env.push("BASHKIT_ALLOW_INPROCESS_SQLITE");
         builder = builder.typescript();

@@ -23,7 +23,7 @@ async-trait = "0.1"
 bashkit = { version = "0.19", features = [
     "realfs",
     "http_client",
-    "python",
+    "cpython",
     "sqlite",
     "typescript",
     "jq",
