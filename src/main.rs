@@ -1,9 +1,9 @@
 use std::io::{IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use bxwrp::bridge::{BRIDGE_ENV, shim};
 use bxwrp::cli::{Cli, ConfigAction, Mode, Options};
-use bxwrp::config::{Config, Host};
+use bxwrp::config::{Config, Host, ToolName};
 use bxwrp::host_tool::ScriptInput;
 use bxwrp::mcp;
 
@@ -39,46 +39,88 @@ fn validate_config(host: Host, overlay: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn shim_main(socket: std::ffi::OsString) -> anyhow::Result<()> {
-    use std::path::Path;
+struct BridgeMain {
+    socket: PathBuf,
+}
 
-    use bxwrp::config::ToolName;
+impl BridgeMain {
+    fn detect() -> Option<Self> {
+        let socket = std::env::var_os(BRIDGE_ENV)?;
+        Some(Self {
+            socket: PathBuf::from(socket),
+        })
+    }
 
-    let mut argv = std::env::args_os();
-    let argv0 = argv.next().unwrap_or_default();
-    let name = Path::new(&argv0)
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let name = ToolName::try_from(name).map_err(|error| anyhow::anyhow!("bxwrp: {error}"))?;
-    let exit_code = shim(Path::new(&socket), name, argv.collect())?;
-    std::process::exit(exit_code);
+    fn main(self) -> anyhow::Result<()> {
+        let mut argv = std::env::args_os();
+        let argv0 = argv.next().unwrap_or_default();
+        let name = Path::new(&argv0)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let tool = ToolName::try_from(name).map_err(|error| anyhow::anyhow!("bxwrp: {error}"))?;
+        let exit_code = shim(&self.socket, tool, argv.collect())?;
+        std::process::exit(exit_code)
+    }
+}
+
+struct ShellMain {
+    shell: &'static str,
+    args: Vec<String>,
+}
+
+impl ShellMain {
+    fn detect() -> Option<Self> {
+        let mut argv = std::env::args_os();
+        let argv0 = PathBuf::from(argv.next()?);
+        let name = argv0.file_name()?.to_str()?;
+        let shell = SHELLS.into_iter().find(|shell| {
+            name.strip_suffix(shell)
+                .is_some_and(|rest| rest.is_empty() || rest.ends_with('-'))
+        })?;
+        Some(Self {
+            shell,
+            args: argv.map(|arg| arg.to_string_lossy().into_owned()).collect(),
+        })
+    }
+
+    fn main(self) -> anyhow::Result<()> {
+        let host = Host::load(&[])?;
+        install_log_subscriber();
+        let settings = host.resolve(Config::default())?;
+        let session = session_path(std::env::var_os("BXWRP_SESSION").map(PathBuf::from))?;
+        let target = if self.args.is_empty() {
+            stdin_script_target(self.shell)?
+        } else {
+            Target::Invoke {
+                arg0: self.shell.to_string(),
+                args: self.args,
+            }
+        };
+        run(target, settings, session)
+    }
+}
+
+struct CliMain;
+
+impl CliMain {
+    fn main() -> anyhow::Result<()> {
+        let cli = Cli::read();
+        match cli.mode {
+            Mode::Config { action } => config_main(action, cli.options),
+            Mode::Exec { args } => shell_main(Some(args), cli.options),
+            Mode::Mcp => shell_main(None, cli.options),
+        }
+    }
 }
 
 fn main() -> anyhow::Result<()> {
-    if let Some(socket) = std::env::var_os(BRIDGE_ENV) {
-        return shim_main(socket);
-    }
-    let mut argv = std::env::args_os();
-    let argv0 = argv.next().map(std::path::PathBuf::from);
-    let shell = argv0.and_then(|path| {
-        let name = path.file_name()?.to_str()?;
-        SHELLS.into_iter().find(|shell| {
-            name.strip_suffix(shell)
-                .is_some_and(|rest| rest.is_empty() || rest.ends_with('-'))
-        })
-    });
-    if let Some(shell) = shell {
-        return sh_alias_main(
-            shell,
-            argv.map(|arg| arg.to_string_lossy().into_owned()).collect(),
-        );
-    }
-    let cli = Cli::read();
-    match cli.mode {
-        Mode::Config { action } => config_main(action, cli.options),
-        Mode::Exec { args } => shell_main(Some(args), cli.options),
-        Mode::Mcp => shell_main(None, cli.options),
+    if let Some(bridge) = BridgeMain::detect() {
+        bridge.main()
+    } else if let Some(shell) = ShellMain::detect() {
+        shell.main()
+    } else {
+        CliMain::main()
     }
 }
 
@@ -100,22 +142,6 @@ fn config_main(action: ConfigAction, options: Options) -> anyhow::Result<()> {
             validate_config(host, options.into_config()?)
         }
     }
-}
-
-fn sh_alias_main(shell: &str, raw: Vec<String>) -> anyhow::Result<()> {
-    let host = Host::load(&[])?;
-    install_log_subscriber();
-    let settings = host.resolve(Config::default())?;
-    let session = session_path(std::env::var_os("BXWRP_SESSION").map(PathBuf::from))?;
-    let target = if raw.is_empty() {
-        stdin_script_target(shell)?
-    } else {
-        Target::Invoke {
-            arg0: shell.to_string(),
-            args: raw,
-        }
-    };
-    run(target, settings, session)
 }
 
 fn shell_main(exec: Option<Vec<String>>, mut options: Options) -> anyhow::Result<()> {
