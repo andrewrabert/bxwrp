@@ -9,12 +9,14 @@ use bxwrp::mcp;
 
 const SH: &str = "sh";
 
-const SH_ALIASES: [&str; 2] = ["bxwrp-sh", SH];
+const BASH: &str = "bash";
+
+const SHELLS: [&str; 2] = [SH, BASH];
 
 enum Target {
     Mcp,
     Invoke { arg0: String, args: Vec<String> },
-    StdinScript,
+    StdinScript { arg0: String },
 }
 
 fn install_log_subscriber() {
@@ -59,12 +61,18 @@ fn main() -> anyhow::Result<()> {
     }
     let mut argv = std::env::args_os();
     let argv0 = argv.next().map(std::path::PathBuf::from);
-    let sh_alias = argv0.is_some_and(|path| {
-        path.file_name()
-            .is_some_and(|name| SH_ALIASES.iter().any(|alias| name == *alias))
+    let shell = argv0.and_then(|path| {
+        let name = path.file_name()?.to_str()?;
+        SHELLS.into_iter().find(|shell| {
+            name.strip_suffix(shell)
+                .is_some_and(|rest| rest.is_empty() || rest.ends_with('-'))
+        })
     });
-    if sh_alias {
-        return sh_alias_main(argv.map(|arg| arg.to_string_lossy().into_owned()).collect());
+    if let Some(shell) = shell {
+        return sh_alias_main(
+            shell,
+            argv.map(|arg| arg.to_string_lossy().into_owned()).collect(),
+        );
     }
     let cli = Cli::read();
     match cli.mode {
@@ -94,16 +102,16 @@ fn config_main(action: ConfigAction, options: Options) -> anyhow::Result<()> {
     }
 }
 
-fn sh_alias_main(raw: Vec<String>) -> anyhow::Result<()> {
+fn sh_alias_main(shell: &str, raw: Vec<String>) -> anyhow::Result<()> {
     let host = Host::load(&[])?;
     install_log_subscriber();
     let settings = host.resolve(Config::default())?;
     let session = session_path(std::env::var_os("BXWRP_SESSION").map(PathBuf::from))?;
     let target = if raw.is_empty() {
-        stdin_script_target()?
+        stdin_script_target(shell)?
     } else {
         Target::Invoke {
-            arg0: SH.to_string(),
+            arg0: shell.to_string(),
             args: raw,
         }
     };
@@ -120,7 +128,7 @@ fn shell_main(exec: Option<Vec<String>>, mut options: Options) -> anyhow::Result
         None => Target::Mcp,
         Some(mut args) => {
             if args.is_empty() {
-                stdin_script_target()?
+                stdin_script_target(SH)?
             } else {
                 let arg0 = args.remove(0);
                 Target::Invoke { arg0, args }
@@ -134,12 +142,14 @@ fn session_path(path: Option<PathBuf>) -> anyhow::Result<Option<PathBuf>> {
     Ok(path.map(std::path::absolute).transpose()?)
 }
 
-fn stdin_script_target() -> anyhow::Result<Target> {
+fn stdin_script_target(arg0: &str) -> anyhow::Result<Target> {
     anyhow::ensure!(
         !std::io::stdin().is_terminal(),
         "exec: pass a command or pipe a script"
     );
-    Ok(Target::StdinScript)
+    Ok(Target::StdinScript {
+        arg0: arg0.to_string(),
+    })
 }
 
 fn run(
@@ -150,12 +160,12 @@ fn run(
     let stdin_is_pipe = !std::io::stdin().is_terminal();
     let invocation = match target {
         Target::Mcp => None,
-        Target::StdinScript => {
+        Target::StdinScript { arg0 } => {
             let mut bytes = Vec::new();
             std::io::stdin().read_to_end(&mut bytes)?;
             let script = String::from_utf8(bytes)
                 .map_err(|_| anyhow::anyhow!("exec: script on stdin is not valid UTF-8"))?;
-            Some((script, SH.to_string(), Vec::new(), false))
+            Some((script, arg0, Vec::new(), false))
         }
         Target::Invoke { arg0, args } => Some((r#""$0" "$@""#.to_string(), arg0, args, true)),
     };

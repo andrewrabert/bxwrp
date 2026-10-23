@@ -30,4 +30,4 @@ Options:
   -h, --help                                       Print help
 ```
 
-Can also be used as a drop-in, non-interactive shell when symlinked to `bxwrp-sh` or `sh`.
+Can also be used as a drop-in, non-interactive shell when symlinked to a name that is `sh` or `bash` or ends with `-sh` or `-bash`.
