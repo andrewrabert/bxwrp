@@ -152,17 +152,35 @@ fn stdin_script_target(arg0: &str) -> anyhow::Result<Target> {
     })
 }
 
+fn read_stdin() -> std::io::Result<ScriptInput> {
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::FileTypeExt;
+
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return Ok(ScriptInput::Closed);
+    }
+    let metadata = std::fs::File::from(stdin.as_fd().try_clone_to_owned()?).metadata()?;
+    if metadata.file_type().is_socket() {
+        return Ok(ScriptInput::Closed);
+    }
+    let mut bytes = Vec::new();
+    stdin.lock().read_to_end(&mut bytes)?;
+    Ok(ScriptInput::Bytes(bytes))
+}
+
 fn run(
     target: Target,
     settings: bxwrp::config::Settings,
     session: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    let stdin_is_pipe = !std::io::stdin().is_terminal();
     let invocation = match target {
         Target::Mcp => None,
         Target::StdinScript { arg0 } => {
-            let mut bytes = Vec::new();
-            std::io::stdin().read_to_end(&mut bytes)?;
+            let bytes = match read_stdin()? {
+                ScriptInput::Closed => Vec::new(),
+                ScriptInput::Bytes(bytes) => bytes,
+            };
             let script = String::from_utf8(bytes)
                 .map_err(|_| anyhow::anyhow!("exec: script on stdin is not valid UTF-8"))?;
             Some((script, arg0, Vec::new(), false))
@@ -170,16 +188,8 @@ fn run(
         Target::Invoke { arg0, args } => Some((r#""$0" "$@""#.to_string(), arg0, args, true)),
     };
     let stdin = match &invocation {
-        Some((_, _, _, true)) if stdin_is_pipe => {
-            let mut bytes = Vec::new();
-            std::io::stdin().read_to_end(&mut bytes)?;
-            Some(bytes)
-        }
-        _ => None,
-    };
-    let stdin = match stdin {
-        None => ScriptInput::Closed,
-        Some(bytes) => ScriptInput::Bytes(bytes),
+        Some((_, _, _, true)) => read_stdin()?,
+        _ => ScriptInput::Closed,
     };
     let result = tokio::runtime::Runtime::new()?.block_on(async {
         let sandbox = bxwrp::backend::new(&settings, session).await?;
