@@ -236,6 +236,9 @@ pub struct ArgConfig {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default: Option<Vec<String>>,
+
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
@@ -623,6 +626,7 @@ pub struct ParamSpec {
     pub description: Option<String>,
     pub args: ArgsTemplate,
     pub default: ArgsTemplate,
+    pub hidden: bool,
 }
 
 #[derive(Clone)]
@@ -706,6 +710,7 @@ fn resolve_tool(name: &ToolName, entry: &McpToolConfig) -> anyhow::Result<McpToo
             description: param.description.clone(),
             args,
             default,
+            hidden: param.hidden,
         });
     }
     Ok(McpTool {

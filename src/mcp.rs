@@ -459,7 +459,7 @@ fn tool_schema(tool: &McpTool) -> JsonObject {
             required.push(String::from("stdin"));
         }
     }
-    for param in &tool.params {
+    for param in tool.params.iter().filter(|param| !param.hidden) {
         let property = if param.args.takes_value() {
             json!({"type": "string"})
         } else {
