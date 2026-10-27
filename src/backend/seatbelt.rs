@@ -232,7 +232,7 @@ impl Seatbelt {
             quote(&resolve(bridge.socket()))?
         ));
 
-        let seatbelt = Self {
+        Ok(Self {
             view,
             global: Filter::of_view(settings),
             base,
@@ -242,18 +242,7 @@ impl Seatbelt {
             tmp,
             shim,
             bridge,
-        };
-        let probe = seatbelt
-            .launcher()?
-            .execute([String::from("/usr/bin/true")], None)
-            .await
-            .context(SANDBOX_EXEC)?;
-        anyhow::ensure!(
-            probe.exit_code == 0,
-            "{}",
-            String::from_utf8_lossy(&probe.stderr).trim_end()
-        );
-        Ok(seatbelt)
+        })
     }
 
     fn launcher(&self) -> anyhow::Result<HostExecutable> {

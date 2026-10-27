@@ -199,7 +199,7 @@ impl Bwrap {
             tracing::warn!("{}: cwd is under no mount", settings.cwd.display());
         }
 
-        let bwrap = Self {
+        Ok(Self {
             head,
             view,
             global: Filter::of_view(settings),
@@ -207,18 +207,7 @@ impl Bwrap {
             tmp,
             scratch,
             bridge,
-        };
-        let probe = bwrap
-            .launcher()?
-            .execute([String::from("/bin/true")], None)
-            .await
-            .context("bwrap")?;
-        anyhow::ensure!(
-            probe.exit_code == 0,
-            "{}",
-            String::from_utf8_lossy(&probe.stderr).trim_end()
-        );
-        Ok(bwrap)
+        })
     }
 
     fn launcher(&self) -> anyhow::Result<HostExecutable> {
