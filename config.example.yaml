@@ -18,6 +18,10 @@ env:
   TZ: UTC
   API_TOKEN: secret
 
+limits:
+  max_input_bytes: 1073741824
+  max_output_bytes: 1048576
+
 paths:
   exclude:
     - "**/.env"

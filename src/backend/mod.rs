@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 
 use crate::config::Settings;
-use crate::host_tool::{HostOutput, ScriptInput, Written};
+use crate::host_tool::{HostOutput, ScriptInput, ScriptOutput, Written};
 
 mod bashkit;
 #[cfg(target_os = "linux")]
@@ -45,6 +45,7 @@ pub trait Backend: Send + Sync {
         arg0: &str,
         args: Vec<String>,
         stdin: ScriptInput,
+        output: ScriptOutput,
     ) -> anyhow::Result<HostOutput>;
 
     async fn read_text(&self, path: &Path) -> anyhow::Result<String>;

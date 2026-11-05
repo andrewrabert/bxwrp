@@ -361,7 +361,9 @@ pub struct HttpConfig {
     pub enabled: bool,
 }
 
-pub const DEFAULT_MAX_INPUT_BYTES: u64 = 100_000_000_000;
+pub const DEFAULT_MAX_INPUT_BYTES: u64 = u64::MAX;
+
+const DEFAULT_MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
 
 pub const DEFAULT_COMMAND_NOT_FOUND: &str = "{% if config.tools is defined %}\
 {% for name, tool in config.tools | items %}\
@@ -374,6 +376,9 @@ help: list builtin commands";
 pub struct LimitsConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_input_bytes: Option<u64>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
@@ -488,6 +493,7 @@ fn merge_limits(base: Option<LimitsConfig>, overlay: Option<LimitsConfig>) -> Op
         (None, other) | (other, None) => other,
         (Some(base), Some(overlay)) => Some(LimitsConfig {
             max_input_bytes: overlay.max_input_bytes.or(base.max_input_bytes),
+            max_output_bytes: overlay.max_output_bytes.or(base.max_output_bytes),
         }),
     }
 }
@@ -897,6 +903,7 @@ pub struct Settings {
     env: EnvConfig,
     network: Option<bashkit::NetworkAllowlist>,
     max_input_bytes: u64,
+    max_output_bytes: u64,
     instructions: Option<String>,
     command_not_found: String,
     host_tools: BTreeMap<ToolName, HostExecutable>,
@@ -967,6 +974,10 @@ impl Settings {
                 .limits
                 .and_then(|limits| limits.max_input_bytes)
                 .unwrap_or(DEFAULT_MAX_INPUT_BYTES),
+            max_output_bytes: config
+                .limits
+                .and_then(|limits| limits.max_output_bytes)
+                .unwrap_or(DEFAULT_MAX_OUTPUT_BYTES),
             instructions: config.mcp.and_then(|mcp| mcp.instructions),
             command_not_found,
             host_tools,
@@ -1002,6 +1013,11 @@ impl Settings {
 
     pub(crate) const fn max_input_bytes(&self) -> u64 {
         self.max_input_bytes
+    }
+
+    #[must_use]
+    pub fn max_output_bytes(&self) -> usize {
+        usize::try_from(self.max_output_bytes).unwrap_or(usize::MAX)
     }
 
     pub(crate) fn builtins(&self) -> impl Iterator<Item = (&ToolName, &HostExecutable)> {

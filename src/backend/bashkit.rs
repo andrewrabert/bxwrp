@@ -3,12 +3,15 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use async_trait::async_trait;
+use tokio::io::AsyncWriteExt as _;
 use tokio::sync::Mutex;
 
 use super::Backend;
 use crate::config::{MountMode, Settings, Source};
-use crate::host_tool::{HostOutput, HostTool, ScriptInput, Written};
+use crate::host_tool::{HostOutput, HostTool, ScriptInput, ScriptOutput, Written};
 use crate::mount::{FilterFs, Layer, MountTable, PathFilter, SingleFile};
+
+const COMMAND_NOT_FOUND_EXIT_CODE: i32 = 127;
 
 fn filtered(
     fs: Arc<dyn bashkit::FileSystem>,
@@ -122,7 +125,7 @@ impl bashkit::Builtin for NotFound {
     ) -> bashkit::Result<bashkit::ExecResult> {
         Ok(bashkit::ExecResult::err(
             format!("bash: {}: command not found\n{}", self.name, self.suffix),
-            127,
+            COMMAND_NOT_FOUND_EXIT_CODE,
         ))
     }
 }
@@ -259,6 +262,8 @@ impl Bashkit {
             .execution_limits()
             .clone()
             .max_aggregate_input_bytes(settings.max_input_bytes())
+            .max_stdout_bytes(settings.max_output_bytes())
+            .max_stderr_bytes(settings.max_output_bytes())
             .max_work_units(u64::MAX);
         let mut builder = bashkit::Bash::builder()
             .profile(profile)
@@ -273,7 +278,7 @@ impl Bashkit {
         }
         for (name, target) in settings.builtins() {
             let host_tool = HostTool::new(name.as_ref().to_string(), target.clone());
-            builder = builder.builtin(name.as_ref(), Box::new(host_tool));
+            builder = builder.command(name.as_ref(), host_tool);
         }
         if let Some(network) = settings.network() {
             builder = builder.network(network);
@@ -326,7 +331,6 @@ impl Bashkit {
         Ok(())
     }
 
-    /// Runs `op` against the session file: restore before, save after success.
     async fn session<T>(&self, op: impl AsyncFnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
         let Some(path) = &self.session else {
             return op().await;
@@ -346,8 +350,13 @@ impl Bashkit {
         let result = op().await?;
         let bytes = self.bash.lock().await.snapshot()?;
         let path = path.clone();
-        tokio::task::spawn_blocking(move || write_session(&path, &bytes)).await??;
-        drop(lock);
+        // The blocking task owns the lock so a cancelled caller cannot release it mid-write.
+        tokio::task::spawn_blocking(move || {
+            let written = write_session(&path, &bytes);
+            drop(lock);
+            written
+        })
+        .await??;
         Ok(result)
     }
 
@@ -357,28 +366,33 @@ impl Bashkit {
         arg0: &str,
         args: Vec<String>,
         stdin: Option<Vec<u8>>,
-    ) -> bashkit::Result<bashkit::ExecResult> {
+        output: ScriptOutput,
+    ) -> anyhow::Result<bashkit::ExecResult> {
         let mut options = bashkit::ExecOptions::new().arg0(arg0).positional(args);
         if let Some(stdin) = stdin {
             options = options.stdin(stdin);
         }
-        self.bash
-            .lock()
-            .await
-            .exec_with_options(script, options)
-            .await
-    }
-
-    pub fn path(&self, path: &str) -> BashkitPath {
-        BashkitPath {
-            fs: Arc::clone(&self.fs),
-            path: bashkit::normalize_path(Path::new(path)),
+        let mut bash = self.bash.lock().await;
+        let execution = bash.execute(script).options(options);
+        match output {
+            ScriptOutput::Capture(capture) => Ok(execution.capture(capture).await?),
+            ScriptOutput::Inherit(_) => {
+                let mut stdout = tokio::io::stdout();
+                let mut stderr = tokio::io::stderr();
+                let result = execution.stdout(&mut stdout).stderr(&mut stderr).await;
+                stdout.flush().await?;
+                stderr.flush().await?;
+                Ok(result?)
+            }
         }
     }
-}
 
-fn vfs(kit: &Bashkit, path: &Path) -> BashkitPath {
-    kit.path(&path.to_string_lossy())
+    pub fn path(&self, path: &Path) -> BashkitPath {
+        BashkitPath {
+            fs: Arc::clone(&self.fs),
+            path: bashkit::normalize_path(path),
+        }
+    }
 }
 
 #[async_trait]
@@ -389,13 +403,14 @@ impl Backend for Bashkit {
         arg0: &str,
         args: Vec<String>,
         stdin: ScriptInput,
+        output: ScriptOutput,
     ) -> anyhow::Result<HostOutput> {
         let stdin = match stdin {
             ScriptInput::Closed => None,
             ScriptInput::Bytes(bytes) => Some(bytes),
         };
         let result = self
-            .session(async || Ok(Self::exec_script(self, script, arg0, args, stdin).await?))
+            .session(async || Self::exec_script(self, script, arg0, args, stdin, output).await)
             .await?;
         let exit_code = match result.control_flow {
             bashkit::ControlFlow::Exit(code) => code,
@@ -405,16 +420,18 @@ impl Backend for Bashkit {
             stdout: result.stdout.into_bytes(),
             stderr: result.stderr.into_bytes(),
             exit_code,
+            stdout_truncated: result.stdout_truncated,
+            stderr_truncated: result.stderr_truncated,
         })
     }
 
     async fn read_text(&self, path: &Path) -> anyhow::Result<String> {
-        let path = vfs(self, path);
+        let path = self.path(path);
         self.session(async || path.read_text().await).await
     }
 
     async fn write_text(&self, path: &Path, content: &str) -> anyhow::Result<Written> {
-        let path = vfs(self, path);
+        let path = self.path(path);
         self.session(async || {
             let existed = path.exists().await?;
             path.parent().mkdir_parents().await?;
@@ -454,7 +471,7 @@ impl BashkitPath {
     }
 
     pub async fn write_text(&self, content: &str) -> anyhow::Result<()> {
-        if self.exists().await? && !self.is_file().await? {
+        if matches!(self.kind().await?, Kind::Directory) {
             anyhow::bail!("Illegal operation on a directory: {}", self.path.display());
         }
         Ok(self.fs.write_file(&self.path, content.as_bytes()).await?)
@@ -464,18 +481,31 @@ impl BashkitPath {
         Ok(self.fs.mkdir(&self.path, true).await?)
     }
 
-    async fn is_file(&self) -> anyhow::Result<bool> {
+    async fn kind(&self) -> anyhow::Result<Kind> {
+        if !self.exists().await? {
+            return Ok(Kind::Missing);
+        }
         let meta = self.fs.stat(&self.path).await?;
-        Ok(meta.file_type.is_file())
+        Ok(if meta.file_type.is_file() {
+            Kind::File
+        } else {
+            Kind::Directory
+        })
     }
 
     async fn require_file(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(self.exists().await?, "File does not exist.");
-        anyhow::ensure!(
-            self.is_file().await?,
-            "Illegal operation on a directory: {}",
-            self.path.display()
-        );
-        Ok(())
+        match self.kind().await? {
+            Kind::Missing => anyhow::bail!("File does not exist."),
+            Kind::Directory => {
+                anyhow::bail!("Illegal operation on a directory: {}", self.path.display())
+            }
+            Kind::File => Ok(()),
+        }
     }
+}
+
+enum Kind {
+    Missing,
+    File,
+    Directory,
 }

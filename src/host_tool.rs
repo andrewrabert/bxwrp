@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 
-use bashkit::{BuiltinContext, ExecResult, StreamData, async_trait};
-use tokio::io::AsyncWriteExt;
+use bashkit::{CommandContext, CommandInput, CommandOutput, CommandStatus, async_trait};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
 
 pub const FAILURE_EXIT_CODE: i32 = 1;
@@ -10,6 +10,12 @@ pub const FAILURE_EXIT_CODE: i32 = 1;
 pub enum ScriptInput {
     Closed,
     Bytes(Vec<u8>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptOutput {
+    Capture(usize),
+    Inherit(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,17 +28,8 @@ pub struct HostOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub exit_code: i32,
-}
-
-impl From<HostOutput> for ExecResult {
-    fn from(output: HostOutput) -> Self {
-        Self {
-            stdout: StreamData::from(output.stdout),
-            stderr: StreamData::from(output.stderr),
-            exit_code: output.exit_code,
-            ..Self::default()
-        }
-    }
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +61,7 @@ impl HostExecutable {
             command.env_clear();
         }
         command.envs(self.env.iter().cloned());
+        command.kill_on_drop(true);
         command
     }
 
@@ -71,6 +69,7 @@ impl HostExecutable {
         &self,
         args: I,
         stdin: Option<Vec<u8>>,
+        output: ScriptOutput,
     ) -> std::io::Result<HostOutput>
     where
         I: IntoIterator<Item = S>,
@@ -78,7 +77,7 @@ impl HostExecutable {
     {
         let mut command = self.command();
         command.args(args);
-        run(command, stdin).await
+        run(command, stdin, output).await
     }
 
     pub async fn spawn_with(
@@ -102,7 +101,40 @@ impl HostTool {
     }
 }
 
-async fn run(mut command: Command, stdin: Option<Vec<u8>>) -> std::io::Result<HostOutput> {
+type Sink<'a> = Box<dyn AsyncWrite + Unpin + Send + 'a>;
+
+/// Returns whether output past the limit was dropped.
+async fn copy_capped(
+    pipe: Option<impl AsyncRead + Unpin>,
+    mut sink: Sink<'_>,
+    limit: u64,
+) -> std::io::Result<bool> {
+    let Some(pipe) = pipe else {
+        return Ok(false);
+    };
+    let mut pipe = pipe.take(limit);
+    match tokio::io::copy(&mut pipe, &mut sink).await {
+        Ok(_) => {}
+        // A closed reader ends the stream as in a shell pipeline; dropping the
+        // pipe sends the child SIGPIPE.
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => return Ok(false),
+        Err(error) => return Err(error),
+    }
+    // Draining past the limit keeps the child from blocking on a full pipe.
+    let dropped = tokio::io::copy(&mut pipe.into_inner(), &mut tokio::io::sink()).await?;
+    if let Err(error) = sink.flush().await
+        && error.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        return Err(error);
+    }
+    Ok(dropped > 0)
+}
+
+async fn run(
+    mut command: Command,
+    stdin: Option<Vec<u8>>,
+    output: ScriptOutput,
+) -> std::io::Result<HostOutput> {
     command
         .stdin(if stdin.is_some() {
             Stdio::piped()
@@ -129,29 +161,122 @@ async fn run(mut command: Command, stdin: Option<Vec<u8>>) -> std::io::Result<Ho
         }
         Ok(())
     };
-    let (stdin_result, output) = tokio::join!(write_stdin, child.wait_with_output());
-    let output = output?;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let (limit, stdout_sink, stderr_sink): (usize, Sink<'_>, Sink<'_>) = match output {
+        ScriptOutput::Capture(limit) => (limit, Box::new(&mut stdout), Box::new(&mut stderr)),
+        ScriptOutput::Inherit(limit) => (
+            limit,
+            Box::new(tokio::io::stdout()),
+            Box::new(tokio::io::stderr()),
+        ),
+    };
+    let limit = u64::try_from(limit).unwrap_or(u64::MAX);
+    let (stdin_result, stdout_truncated, stderr_truncated, status) = tokio::join!(
+        write_stdin,
+        copy_capped(child.stdout.take(), stdout_sink, limit),
+        copy_capped(child.stderr.take(), stderr_sink, limit),
+        child.wait(),
+    );
+    let status = status?;
+    let stdout_truncated = stdout_truncated?;
+    let stderr_truncated = stderr_truncated?;
     stdin_result?;
     Ok(HostOutput {
-        stdout: output.stdout,
-        stderr: output.stderr,
-        exit_code: output.status.code().unwrap_or(FAILURE_EXIT_CODE),
+        stdout,
+        stderr,
+        exit_code: status.code().unwrap_or(FAILURE_EXIT_CODE),
+        stdout_truncated,
+        stderr_truncated,
     })
 }
 
-#[async_trait]
-impl bashkit::Builtin for HostTool {
-    async fn execute(&self, ctx: BuiltinContext<'_>) -> bashkit::Result<ExecResult> {
-        match self
-            .executable
-            .execute(ctx.args, ctx.stdin_bytes().map(<[u8]>::to_vec))
-            .await
-        {
-            Ok(result) => Ok(result.into()),
-            Err(error) => Ok(ExecResult::err(
-                format!("bxwrp: {}: {error}", self.name),
-                FAILURE_EXIT_CODE,
-            )),
+enum Delivery {
+    Sent,
+    ReaderClosed,
+}
+
+/// A closed reader ends the stream as in a shell pipeline; other errors propagate.
+fn delivery(written: bashkit::Result<()>) -> bashkit::Result<Delivery> {
+    match written {
+        Ok(()) => Ok(Delivery::Sent),
+        Err(bashkit::Error::Io(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+            Ok(Delivery::ReaderClosed)
         }
+        Err(error) => Err(error),
+    }
+}
+
+/// Stops early when the child closes its stdin; dropping the pipe is its EOF.
+async fn feed(input: CommandInput, mut pipe: impl AsyncWrite + Unpin) -> bashkit::Result<()> {
+    while let Some(chunk) = input.read_chunk().await? {
+        match pipe.write_all(&chunk).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+            Err(error) => return Err(bashkit::Error::Io(error)),
+        }
+    }
+    match pipe.shutdown().await {
+        Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => {
+            Err(bashkit::Error::Io(error))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Stops when the reader closes; dropping the pipe sends the child SIGPIPE.
+async fn relay(mut pipe: impl AsyncRead + Unpin, output: CommandOutput) -> bashkit::Result<()> {
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = match pipe.read(&mut chunk).await {
+            Ok(0) => return Ok(()),
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(bashkit::Error::Io(error)),
+        };
+        match delivery(output.write_all(&chunk[..read]).await)? {
+            Delivery::Sent => {}
+            Delivery::ReaderClosed => return Ok(()),
+        }
+    }
+}
+
+#[async_trait]
+impl bashkit::Command for HostTool {
+    async fn execute(&self, ctx: CommandContext<'_>) -> bashkit::Result<CommandStatus> {
+        let mut command = self.executable.command();
+        command
+            .args(ctx.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                let message = format!("bxwrp: {}: {error}\n", self.name);
+                delivery(ctx.stderr.write_all(message.as_bytes()).await)?;
+                return Ok(CommandStatus::with_code(FAILURE_EXIT_CODE));
+            }
+        };
+        let (Some(pipe), Some(stdout), Some(stderr)) =
+            (child.stdin.take(), child.stdout.take(), child.stderr.take())
+        else {
+            unreachable!("every child stream is piped");
+        };
+        let input = ctx.stdin;
+        // An exited child reads no more input, so stop waiting on upstream.
+        let wait = async {
+            let fed = tokio::select! {
+                status = child.wait() => return status.map_err(bashkit::Error::Io),
+                fed = feed(input, pipe) => fed,
+            };
+            fed?;
+            child.wait().await.map_err(bashkit::Error::Io)
+        };
+        let (status, (), ()) =
+            tokio::try_join!(wait, relay(stdout, ctx.stdout), relay(stderr, ctx.stderr),)?;
+        Ok(CommandStatus::with_code(
+            status.code().unwrap_or(FAILURE_EXIT_CODE),
+        ))
     }
 }

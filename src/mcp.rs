@@ -23,9 +23,8 @@ use crate::config::{McpTool, ParamSpec, RemainderSpec, Settings};
 use crate::host_tool::HostExecutable;
 use crate::host_tool::HostOutput;
 use crate::host_tool::ScriptInput;
+use crate::host_tool::ScriptOutput;
 use crate::host_tool::Written;
-
-const MAX_BYTES: usize = 256 * 1024;
 
 pub async fn serve(sandbox: Box<dyn Backend>, settings: Settings) -> anyhow::Result<()> {
     let service = Server::new(sandbox, settings).serve(stdio()).await?;
@@ -33,21 +32,37 @@ pub async fn serve(sandbox: Box<dyn Backend>, settings: Settings) -> anyhow::Res
     Ok(())
 }
 
-async fn run(sandbox: &dyn Backend, command: &str) -> anyhow::Result<String> {
+async fn run(sandbox: &dyn Backend, command: &str, limit: usize) -> anyhow::Result<String> {
     let result = sandbox
-        .exec_script(command, "bash", Vec::new(), ScriptInput::Closed)
+        .exec_script(
+            command,
+            "bash",
+            Vec::new(),
+            ScriptInput::Closed,
+            ScriptOutput::Capture(limit),
+        )
         .await?;
+    Ok(output_text(&result, limit))
+}
+
+fn output_text(result: &HostOutput, limit: usize) -> String {
     let mut parts = Vec::new();
     if !result.stdout.is_empty() {
         parts.push(String::from_utf8_lossy(&result.stdout).into_owned());
     }
+    if result.stdout_truncated {
+        parts.push(format!("(stdout truncated to {limit} bytes)"));
+    }
     if !result.stderr.is_empty() {
         parts.push(String::from_utf8_lossy(&result.stderr).into_owned());
+    }
+    if result.stderr_truncated {
+        parts.push(format!("(stderr truncated to {limit} bytes)"));
     }
     if result.exit_code != 0 {
         parts.push(format!("(exit code {})", result.exit_code));
     }
-    Ok(parts.join("\n"))
+    parts.join("\n")
 }
 
 fn success(message: impl Into<String>) -> CallToolResult {
@@ -58,18 +73,8 @@ fn tool_error(message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message.into())])
 }
 
-fn tool_output(result: HostOutput) -> CallToolResult {
-    let mut parts = Vec::new();
-    if !result.stdout.is_empty() {
-        parts.push(String::from_utf8_lossy(&result.stdout).into_owned());
-    }
-    if !result.stderr.is_empty() {
-        parts.push(String::from_utf8_lossy(&result.stderr).into_owned());
-    }
-    if result.exit_code != 0 {
-        parts.push(format!("(exit code {})", result.exit_code));
-    }
-    let text = parts.join("\n");
+fn tool_output(result: &HostOutput, limit: usize) -> CallToolResult {
+    let text = output_text(result, limit);
     match result.exit_code {
         0 => success(text),
         _ => tool_error(text),
@@ -274,9 +279,15 @@ impl Def {
         let attr = self.0.attr();
         ToolRoute::new_dyn(attr, move |context: ToolCallContext<'_, Server>| {
             let def = self.clone();
+            let ct = context.request_context.ct.clone();
             Box::pin(async move {
                 let arguments = context.arguments.clone().unwrap_or_default();
-                Ok(def.0.call(context.service, arguments).await.into())
+                let result = tokio::select! {
+                    biased;
+                    () = ct.cancelled() => tool_error("The tool call was cancelled."),
+                    result = def.0.call(context.service, arguments) => result,
+                };
+                Ok(result.into())
             })
         })
     }
@@ -427,14 +438,15 @@ impl ToolDef for Invocation {
         )
     }
 
-    fn call<'a>(&'a self, _server: &'a Server, arguments: JsonObject) -> CallFuture<'a> {
+    fn call<'a>(&'a self, server: &'a Server, arguments: JsonObject) -> CallFuture<'a> {
         Box::pin(async move {
+            let limit = server.settings.max_output_bytes();
             let result = match Call::parse(&self.0, &arguments) {
-                Ok(call) => call.execute().await,
+                Ok(call) => call.execute(limit).await,
                 Err(message) => Err(message),
             };
             match result {
-                Ok(output) => tool_output(output),
+                Ok(output) => tool_output(&output, limit),
                 Err(message) => tool_error(message),
             }
         })
@@ -563,9 +575,9 @@ impl<'a> Call<'a> {
         })
     }
 
-    async fn execute(self) -> Result<HostOutput, String> {
+    async fn execute(self, limit: usize) -> Result<HostOutput, String> {
         self.target
-            .execute(self.argv, self.stdin)
+            .execute(self.argv, self.stdin, ScriptOutput::Capture(limit))
             .await
             .map_err(|error| error.to_string())
     }
@@ -591,7 +603,13 @@ impl Server {
     }
 
     async fn bash(&self, args: BashArgs) -> CallToolResult {
-        match run(&*self.sandbox, &args.command.0).await {
+        match run(
+            &*self.sandbox,
+            &args.command.0,
+            self.settings.max_output_bytes(),
+        )
+        .await
+        {
             Ok(output) => success(output),
             Err(e) => tool_error(e.to_string()),
         }
@@ -609,14 +627,13 @@ impl Server {
         let whole_file = args.offset.is_start() && matches!(args.limit, LineLimit::Rest);
         if whole_file {
             let size = text.len();
-            if size > MAX_BYTES {
+            let limit = self.settings.max_output_bytes();
+            if size > limit {
                 return tool_error(format!(
-                    "File content ({:.1}KB) exceeds maximum allowed size \
-                     ({}KB). Use offset and limit parameters to read \
+                    "File content ({size} bytes) exceeds maximum allowed size \
+                     ({limit} bytes). Use offset and limit parameters to read \
                      specific portions of the file, or search for specific \
                      content instead of reading the whole file.",
-                    size as f64 / 1024.0,
-                    MAX_BYTES / 1024,
                 ));
             }
         }

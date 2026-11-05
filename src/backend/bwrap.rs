@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use super::Backend;
 use crate::bridge::{BRIDGE_ENV, Bridge};
 use crate::config::{Http, MountMode, Settings, Source, ToolName};
-use crate::host_tool::{HostExecutable, HostOutput, ScriptInput, Written};
+use crate::host_tool::{HostExecutable, HostOutput, ScriptInput, ScriptOutput, Written};
 use crate::mount::{Entry, Visibility};
 use crate::view::{
     Fate, Filter, Location, Removal, Served, TMP, View, entry_of, read_located, scratch_dir, shape,
@@ -306,6 +306,7 @@ impl Backend for Bwrap {
         arg0: &str,
         args: Vec<String>,
         stdin: ScriptInput,
+        output: ScriptOutput,
     ) -> anyhow::Result<HostOutput> {
         let mut argv = vec![
             String::from(SHELL),
@@ -318,7 +319,7 @@ impl Backend for Bwrap {
             ScriptInput::Closed => None,
             ScriptInput::Bytes(bytes) => Some(bytes),
         };
-        Ok(self.launcher()?.execute(argv, stdin).await?)
+        Ok(self.launcher()?.execute(argv, stdin, output).await?)
     }
 
     async fn read_text(&self, path: &Path) -> anyhow::Result<String> {

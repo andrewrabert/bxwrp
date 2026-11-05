@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use bxwrp::bridge::{BRIDGE_ENV, shim};
 use bxwrp::cli::{Cli, ConfigAction, Mode, Options};
 use bxwrp::config::{Config, Host, ToolName};
-use bxwrp::host_tool::ScriptInput;
+use bxwrp::host_tool::{ScriptInput, ScriptOutput};
 use bxwrp::mcp;
 
 const SH: &str = "sh";
@@ -217,27 +217,39 @@ fn run(
         Some((_, _, _, true)) => read_stdin()?,
         _ => ScriptInput::Closed,
     };
+    let limit = settings.max_output_bytes();
     let result = tokio::runtime::Runtime::new()?.block_on(async {
         let sandbox = bxwrp::backend::new(&settings, session).await?;
         if let Some((script, arg0, args, _)) = invocation {
             Ok::<_, anyhow::Error>(Some(
-                sandbox.exec_script(&script, &arg0, args, stdin).await?,
+                sandbox
+                    .exec_script(&script, &arg0, args, stdin, ScriptOutput::Inherit(limit))
+                    .await?,
             ))
         } else {
             mcp::serve(sandbox, settings).await?;
             Ok(None)
         }
     })?;
-    if let Some(result) = result {
-        let mut stdout = std::io::stdout().lock();
-        stdout.write_all(&result.stdout)?;
-        stdout.flush()?;
-        let mut stderr = std::io::stderr().lock();
-        stderr.write_all(&result.stderr)?;
-        stderr.flush()?;
-        if result.exit_code != 0 {
-            std::process::exit(result.exit_code);
-        }
+    let Some(result) = result else {
+        return Ok(());
+    };
+    let truncated: Vec<&str> = [
+        ("stdout", result.stdout_truncated),
+        ("stderr", result.stderr_truncated),
+    ]
+    .into_iter()
+    .filter_map(|(stream, truncated)| truncated.then_some(stream))
+    .collect();
+    if !truncated.is_empty() {
+        writeln!(
+            std::io::stderr(),
+            "bxwrp: {} truncated to {limit} bytes",
+            truncated.join(" and ")
+        )?;
+    }
+    if result.exit_code != 0 {
+        std::process::exit(result.exit_code);
     }
     Ok(())
 }
