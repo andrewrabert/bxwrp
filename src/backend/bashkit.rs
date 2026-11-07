@@ -257,17 +257,20 @@ impl Bashkit {
             Arc::new(MountTable::new(Arc::clone(&memory), layers));
         let table = filtered(table, settings.filter.as_ref());
 
-        let profile = bashkit::ExecutionProfile::named(bashkit::ExecutionProfileName::Interactive);
-        let limits = profile
+        let base = bashkit::ExecutionProfile::named(bashkit::ExecutionProfileName::Interactive);
+        let limits = base
             .execution_limits()
             .clone()
             .max_aggregate_input_bytes(settings.max_input_bytes())
             .max_stdout_bytes(settings.max_output_bytes())
             .max_stderr_bytes(settings.max_output_bytes())
             .max_work_units(u64::MAX);
+        let profile =
+            bashkit::ExecutionProfile::builder(bashkit::ExecutionProfileName::Interactive)
+                .execution_limits(limits)
+                .build()?;
         let mut builder = bashkit::Bash::builder()
             .profile(profile)
-            .limits(limits)
             .hostname(settings.hostname())
             .username(settings.username())
             .cwd(settings.cwd.clone())
