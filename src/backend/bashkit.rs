@@ -415,14 +415,10 @@ impl Backend for Bashkit {
         let result = self
             .session(async || Self::exec_script(self, script, arg0, args, stdin, output).await)
             .await?;
-        let exit_code = match result.control_flow {
-            bashkit::ControlFlow::Exit(code) => code,
-            _ => result.exit_code,
-        };
         Ok(HostOutput {
             stdout: result.stdout.into_bytes(),
             stderr: result.stderr.into_bytes(),
-            exit_code,
+            exit_code: result.exit_code,
             stdout_truncated: result.stdout_truncated,
             stderr_truncated: result.stderr_truncated,
         })
